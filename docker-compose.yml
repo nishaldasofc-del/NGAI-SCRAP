@@ -1,0 +1,192 @@
+version: "3.9"
+
+# =============================================================================
+# NGAI — Nishal Global Artificial Intelligence
+# Ultra Extreme Internet Intelligence Engine
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — primary relational store
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ngai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ngai
+      POSTGRES_PASSWORD: ngaisecret
+      POSTGRES_DB: ngai
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ngai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis — Celery broker + result backend
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ngai-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Qdrant — vector memory (semantic search)
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: ngai-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "6333:6333"   # HTTP / REST
+      - "6334:6334"   # gRPC
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MinIO — object storage (raw HTML / screenshots)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: ngai-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-ngai_minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-ngai_minio_secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # S3-compatible API
+      - "9001:9001"   # web console
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # NGAI API — FastAPI application
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ngai-api
+    restart: unless-stopped
+    command: >
+      uvicorn ngai:app
+        --host 0.0.0.0
+        --port 8000
+        --workers 4
+        --log-level info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ngai:ngaisecret@postgres/ngai
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./ngai.py:/app/ngai.py:ro   # mount source for quick dev iteration
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/ngai/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Celery worker — distributed background tasks
+  # ---------------------------------------------------------------------------
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ngai-worker
+    restart: unless-stopped
+    command: >
+      celery -A ngai.celery_app worker
+        --loglevel=info
+        --concurrency=4
+        -Q celery
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ngai:ngaisecret@postgres/ngai
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+      MINIO_ENDPOINT: minio:9000
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ngai.py:/app/ngai.py:ro
+
+  # ---------------------------------------------------------------------------
+  # Celery beat — periodic scheduler (monitors every 5 min, predictions hourly)
+  # ---------------------------------------------------------------------------
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ngai-beat
+    restart: unless-stopped
+    command: >
+      celery -A ngai.celery_app beat
+        --loglevel=info
+        --scheduler celery.beat:PersistentScheduler
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://ngai:ngaisecret@postgres/ngai
+      REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./ngai.py:/app/ngai.py:ro
+      - beat_schedule:/app/celerybeat-schedule
+
+# =============================================================================
+# Named volumes
+# =============================================================================
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  minio_data:
+  beat_schedule:
